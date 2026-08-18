@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>YouTube Music Streaming Service Private Library (Local)</title>
+<style>
+  :root{--bg:#0f1724;--card:#0b1320;--accent:#1db954;--muted:#93a3b5;--glass: rgba(255,255,255,0.03);}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#071028 0%,#08111b 100%);color:#e6eef6}
+  header{display:flex;align-items:center;gap:16px;padding:16px 20px}
+  h1{font-size:18px;margin:0;font-weight:600}
+  .controls{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .btn{background:var(--accent);border:none;color:#042018;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:600}
+  .muted{color:var(--muted);font-size:13px}
+  main{display:flex;gap:16px;padding:16px}
+  .left{width:360px;background:var(--card);padding:12px;border-radius:12px;box-shadow:0 6px 18px rgba(2,6,23,0.6)}
+  .drop{border:2px dashed var(--glass);padding:12px;border-radius:8px;text-align:center;cursor:pointer}
+  input[type=file]{display:none}
+  ul.library{list-style:none;padding:0;margin:12px 0;max-height:64vh;overflow:auto}
+  li.track{display:flex;align-items:center;gap:10px;padding:8px;border-radius:8px;margin-bottom:8px;background:linear-gradient(90deg, rgba(255,255,255,0.02), transparent)}
+  .track .meta{flex:1;min-width:0}
+  .track .meta .title{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .track .meta .sub{font-size:12px;color:var(--muted)}
+  .small-btn{background:transparent;border:none;color:var(--muted);cursor:pointer;padding:6px;border-radius:6px}
+  .player{flex:1;background:var(--card);padding:16px;border-radius:12px;display:flex;flex-direction:column;gap:12px}
+  .viz{height:200px;background:#02070b;border-radius:8px;overflow:hidden}
+  .controls-row{display:flex;gap:8px;align-items:center}
+  .seek{width:100%}
+  .time{font-family:monospace;color:var(--muted);font-size:13px}
+  footer.note{padding:12px;color:var(--muted);font-size:13px}
+  @media (max-width:900px){main{flex-direction:column} .left{width:100%}}
+</style>
+</head>
+<body>
+<header>
+  <h1>YouTube Music Streaming Service Private Library (Local)</h1>
+  <div class="muted">Offline library — local files only</div>
+  <div class="controls">
+    <label class="btn" id="addBtn">Add files<input id="fileInput" type="file" accept="audio/*" multiple></label>
+    <button class="btn" id="clearCacheBtn">Clear Cache</button>
+  </div>
+</header>
+
+<main>
+  <aside class="left">
+    <div class="drop" id="dropZone">Drag & drop audio files here or click "Add files"</div>
+    <ul class="library" id="library"></ul>
+    <footer class="note">
+      Stored in IndexedDB — persists across sessions. Deleting a track removes it permanently.
+    </footer>
+  </aside>
+
+  <section class="player">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div id="nowTitle" style="font-weight:700">No track selected</div>
+        <div class="muted" id="nowDetails">—</div>
+      </div>
+      <div class="muted" id="gpuStatus">GPU: checking...</div>
+    </div>
+
+    <div class="viz" id="viz"><canvas id="canvas" width="800" height="400" style="width:100%;height:100%"></canvas></div>
+
+    <div class="controls-row">
+      <button class="btn" id="playBtn">Play</button>
+      <button class="small-btn" id="pauseBtn">Pause</button>
+      <button class="small-btn" id="stopBtn">Stop</button>
+      <label style="margin-left:8px;color:var(--muted)">Gain <input id="gain" type="range" min="0" max="2" step="0.01" value="1" style="vertical-align:middle"></label>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <div class="time" id="currentTime">00:00</div>
+        <input type="range" id="seek" class="seek" min="0" max="100" value="0">
+        <div class="time" id="duration">00:00</div>
+      </div>
+    </div>
+
+    <div class="muted">Processing backend: <span id="backend">detecting...</span></div>
+  </section>
+</main>
+
+<script>
+/* -----------------------------
+   IndexedDB helper (simple)
+   ----------------------------- */
+const DB_NAME = 'ytms-private-library';
+const STORE = 'tracks';
+async function openDB(){
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(STORE)){
+        const os = db.createObjectStore(STORE, { keyPath:'id', autoIncrement:true });
+        os.createIndex('byName','name',{unique:false});
+      }
+    };
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function addTrack(name, blob, duration){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE,'readwrite');
+    const store = tx.objectStore(STORE);
+    const obj = { name, blob, createdAt:Date.now(), duration };
+    const r = store.add(obj);
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function getAllTracks(){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE,'readonly');
+    const store = tx.objectStore(STORE);
+    const r = store.getAll();
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function getTrack(id){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE,'readonly');
+    const store = tx.objectStore(STORE);
+    const r = store.get(Number(id));
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function deleteTrack(id){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE,'readwrite');
+    const store = tx.objectStore(STORE);
+    const r = store.delete(Number(id));
+    r.onsuccess = ()=> res();
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function clearDB(){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE,'readwrite');
+    const store = tx.objectStore(STORE);
+    const r = store.clear();
+    r.onsuccess = ()=> res();
+    r.onerror = ()=> rej(r.error);
+  });
+}
+
+/* -----------------------------
+   UI wiring
+   ----------------------------- */
+const fileInput = document.getElementById('fileInput');
+const addBtn = document.getElementById('addBtn');
+const dropZone = document.getElementById('dropZone');
+const libraryEl = document.getElementById('library');
+const nowTitle = document.getElementById('nowTitle');
+const nowDetails = document.getElementById('nowDetails');
+const playBtn = document.getElementById('playBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const stopBtn = document.getElementById('stopBtn');
+const seekEl = document.getElementById('seek');
+const currentTimeEl = document.getElementById('currentTime');
+const durationEl = document.getElementById('duration');
+const gainEl = document.getElementById('gain');
+const backendEl = document.getElementById('backend');
+const gpuStatusEl = document.getElementById('gpuStatus');
+const clearCacheBtn = document.getElementById('clearCacheBtn');
+
+fileInput.addEventListener('change', e => handleFiles(e.target.files));
+dropZone.addEventListener('click', ()=> fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor='#1db954' });
+dropZone.addEventListener('dragleave', e => { e.preventDefault(); dropZone.style.borderColor='' });
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.style.borderColor='';
+  if(e.dataTransfer.files) handleFiles(e.dataTransfer.files);
+});
+
+async function handleFiles(list){
+  for(const f of Array.from(list)){
+    if(!f.type.startsWith('audio/')) continue;
+    // decode duration quickly
+    const array = await f.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    try{
+      const buf = await ctx.decodeAudioData(array.slice(0));
+      const duration = buf.duration || 0;
+      await addTrack(f.name, new Blob([array], {type:f.type}), duration);
+    }catch(err){
+      // fallback: unknown duration
+      await addTrack(f.name, new Blob([array], {type:f.type}), 0);
+    } finally {
+      ctx.close();
+    }
+  }
+  renderLibrary();
+}
+
+async function renderLibrary(){
+  const tracks = await getAllTracks();
+  libraryEl.innerHTML = '';
+  if(tracks.length===0){
+    libraryEl.innerHTML = '<div class="muted" style="padding:8px">No tracks yet</div>';
+    return;
+  }
+  for(const t of tracks.sort((a,b)=>b.createdAt-a.createdAt)){
+    const li = document.createElement('li');
+    li.className = 'track';
+    li.innerHTML = `
+      <div style="width:44px;height:44px;border-radius:6px;background:linear-gradient(135deg,#071e12,#093022);display:flex;align-items:center;justify-content:center;color:#9be8b5;font-weight:700">♫</div>
+      <div class="meta">
+        <div class="title">${escapeHtml(t.name)}</div>
+        <div class="sub">${t.duration?formatTime(t.duration):'unknown duration'} • added ${timeAgo(t.createdAt)}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+        <button class="small-btn" data-id="${t.id}" data-action="play">▶</button>
+        <button class="small-btn" data-id="${t.id}" data-action="delete" title="Delete">🗑</button>
+      </div>
+    `;
+    libraryEl.appendChild(li);
+  }
+  libraryEl.querySelectorAll('button[data-action]').forEach(btn=>{
+    btn.addEventListener('click', async e=>{
+      const id = btn.dataset.id;
+      const action = btn.dataset.action;
+      if(action==='play') await selectTrack(id);
+      if(action==='delete'){
+        if(!confirm('Delete this track from the local library? This cannot be undone.')) return;
+        await deleteTrack(id);
+        await renderLibrary();
+        if(currentTrack && String(currentTrack.id)===String(id)) stopPlayback();
+      }
+    });
+  });
+}
+
+/* -----------------------------
+   Audio + processing (WebGPU or CPU fallback)
+   ----------------------------- */
+let currentTrack = null;
+let audioCtx = null;
+let sourceNode = null;
+let analyser = null;
+let rafId = null;
+let startTime = 0;
+let pausedAt = 0;
+let processedBuffer = null; // AudioBuffer after processing
+let backend = 'unknown';
+let gpuAvailable = false;
+
+// WebGPU init lazy
+let gpuAdapter = null;
+let gpuDevice = null;
+
+async function detectGPU(){
+  gpuAvailable = !!navigator.gpu;
+  gpuStatusEl.textContent = gpuAvailable ? 'available' : 'unavailable';
+  backendEl.textContent = gpuAvailable ? 'WebGPU compute (preferred)' : 'CPU processing';
+  backend = gpuAvailable ? 'webgpu' : 'cpu';
+  if(gpuAvailable){
+    try{
+      gpuAdapter = await navigator.gpu.requestAdapter();
+      gpuDevice = await gpuAdapter.requestDevice();
+    }catch(e){
+      gpuAvailable = false;
+      gpuStatusEl.textContent = 'unavailable';
+      backendEl.textContent = 'CPU processing';
+      backend = 'cpu';
+    }
+  }
+}
+detectGPU();
+
+/* Play flow:
+   - get track blob
+   - decode via AudioContext.decodeAudioData
+   - run processing: if webgpu available use GPU compute to apply gain
+   - create AudioBufferSourceNode from processed buffer and play
+*/
+async function selectTrack(id){
+  const t = await getTrack(id);
+  if(!t) return alert('Track not found');
+  currentTrack = t;
+  nowTitle.textContent = t.name;
+  nowDetails.textContent = `Added ${timeAgo(t.createdAt)} • ${t.duration?formatTime(t.duration):'unknown'}`;
+  // prepare processed buffer (lazy)
+  processedBuffer = null;
+  pausedAt = 0;
+  startTime = 0;
+  await prepareTrackForPlayback(t);
+}
+
+async function prepareTrackForPlayback(track){
+  // decode original audio
+  const arr = await track.blob.arrayBuffer();
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await audioCtx.decodeAudioData(arr.slice(0));
+  // apply GPU or CPU processing on decoded data
+  const gainVal = Number(gainEl.value) || 1;
+  if(backend === 'webgpu'){
+    try {
+      processedBuffer = await processAudioWithWebGPU(decoded, gainVal);
+    } catch(err){
+      console.warn('WebGPU processing failed, falling back to CPU', err);
+      processedBuffer = processAudioWithCPU(decoded, gainVal);
+      backend = 'cpu';
+      backendEl.textContent = 'CPU processing (fallback)';
+      gpuStatusEl.textContent = 'GPU fallen back';
+    }
+  } else {
+    processedBuffer = processAudioWithCPU(decoded, gainVal);
+  }
+  durationEl.textContent = formatTime(processedBuffer.duration);
+  seekEl.value = 0;
+  currentTimeEl.textContent = '00:00';
+}
+
+/* CPU processing: simple per-sample multiply (gain). Returns a new AudioBuffer */
+function processAudioWithCPU(audioBuffer, gain=1){
+  const channels = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length;
+  const sampleRate = audioBuffer.sampleRate;
+  const out = audioCtx.createBuffer(channels, length, sampleRate);
+  for(let ch=0; ch<channels; ch++){
+    const inData = audioBuffer.getChannelData(ch);
+    const outData = out.getChannelData(ch);
+    for(let i=0;i<length;i++){
+      outData[i] = inData[i] * gain;
+    }
+  }
+  return out;
+}
+
+/* WebGPU processing:
+   - Flatten channels into interleaved buffer? To simplify, process each channel separately in GPU.
+   - We'll process channel-by-channel: write Float32Array to GPU buffer, multiply by gain, copy back.
+*/
+async function processAudioWithWebGPU(audioBuffer, gain=1){
+  if(!gpuDevice) throw new Error('GPU device unavailable');
+  const channels = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length;
+  const sampleRate = audioBuffer.sampleRate;
+  const out = audioCtx.createBuffer(channels, length, sampleRate);
+
+  // WGSL compute shader: multiply each sample by a uniform gain.
+  const wgsl = `
+  struct Params { gain: f32; };
+  @group(0) @binding(0) var<uniform> params: Params;
+  @group(0) @binding(1) var<storage, read> inBuf: array<f32>;
+  @group(0) @binding(2) var<storage, read_write> outBuf: array<f32>;
+
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let i : u32 = id.x;
+    if (i < arrayLength(&inBuf)) {
+      outBuf[i] = inBuf[i] * params.gain;
+    }
+  }
+  `;
+  // Create pipeline
+  const module = gpuDevice.createShaderModule({code:wgsl});
+  const pipeline = gpuDevice.createComputePipeline({
+    layout: 'auto',
+    compute: { module, entryPoint: 'main' }
+  });
+
+  // For each channel: write -> compute -> readback
+  for(let ch=0; ch<channels; ch++){
+    const input = audioBuffer.getChannelData(ch);
+    const inputBytes = input.byteLength;
+
+    // GPU buffers
+    const inBuf = gpuDevice.createBuffer({
+      size: inputBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    const outBuf = gpuDevice.createBuffer({
+      size: inputBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+
+    // Uniform buffer for gain (4 bytes aligned to 4)
+    const uniformBuf = gpuDevice.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    // Write data
+    gpuDevice.queue.writeBuffer(inBuf, 0, input.buffer, input.byteOffset, input.byteLength);
+    const gainArr = new Float32Array([gain]);
+    gpuDevice.queue.writeBuffer(uniformBuf, 0, gainArr.buffer, gainArr.byteOffset, gainArr.byteLength);
+
+    // Bind group
+    const bindGroup = gpuDevice.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: inBuf } },
+        { binding: 2, resource: { buffer: outBuf } }
+      ]
+    });
+
+    // Command encoder
+    const encoder = gpuDevice.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    const numWorkgroups = Math.ceil(input.length / 64);
+    pass.dispatchWorkgroups(numWorkgroups);
+    pass.end();
+    // Copy outBuf -> readback buffer
+    const readback = gpuDevice.createBuffer({
+      size: inputBytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+    encoder.copyBufferToBuffer(outBuf, 0, readback, 0, inputBytes);
+    gpuDevice.queue.submit([encoder.finish()]);
+
+    // Map and read
+    await readback.mapAsync(GPUMapMode.READ);
+    const copyArrayBuffer = readback.getMappedRange().slice(0);
+    readback.unmap();
+    const result = new Float32Array(copyArrayBuffer);
+    // set channel
+    out.getChannelData(ch).set(result);
+    // destroy small buffers (no explicit destroy in some impls) - optional
+  }
+  return out;
+}
+
+/* Playback control functions */
+function startPlayback(){
+  if(!processedBuffer) return alert('No track prepared. Select a track.');
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  stopPlayback(false); // stop existing but don't clear currentTrack
+
+  sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = processedBuffer;
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  sourceNode.connect(analyser);
+  analyser.connect(audioCtx.destination);
+  sourceNode.start(0, pausedAt);
+  startTime = audioCtx.currentTime - pausedAt;
+  // update UI
+  playBtn.disabled = true;
+  pauseBtn.disabled = false;
+  stopBtn.disabled = false;
+  drawViz();
+  sourceNode.onended = ()=> {
+    stopPlayback(true);
+  };
+}
+
+function pausePlayback(){
+  if(!sourceNode) return;
+  sourceNode.stop();
+  pausedAt = audioCtx.currentTime - startTime;
+  playBtn.disabled = false;
+  pauseBtn.disabled = true;
+  cancelAnimationFrame(rafId);
+}
+
+function stopPlayback(clearSelection=true){
+  if(sourceNode){
+    try{ sourceNode.stop(); }catch(e){}
+    sourceNode.disconnect?.();
+    sourceNode = null;
+  }
+  pausedAt = 0;
+  playBtn.disabled = false;
+  pauseBtn.disabled = true;
+  stopBtn.disabled = true;
+  cancelAnimationFrame(rafId);
+  currentTimeEl.textContent = '00:00';
+  seekEl.value = 0;
+  if(clearSelection){
+    // don't clear currentTrack, but you could
+  }
+}
+
+/* Viz */
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function drawViz(){
+  if(!analyser) return;
+  const bufferLength = analyser.fftSize;
+  const data = new Uint8Array(bufferLength);
+  function draw(){
+    rafId = requestAnimationFrame(draw);
+    analyser.getByteTimeDomainData(data);
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.fillStyle = '#02070b';
+    ctx.fillRect(0,0,w,h);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#1db954';
+    ctx.beginPath();
+    const slice = bufferLength / w;
+    for(let i=0;i<w;i++){
+      const v = data[Math.floor(i*slice)]/128.0;
+      const y = v * h/2;
+      if(i===0) ctx.moveTo(i,y);
+      else ctx.lineTo(i,y);
+    }
+    ctx.stroke();
+
+    // update time & seek
+    if(audioCtx && sourceNode){
+      const pos = audioCtx.currentTime - startTime;
+      const dur = processedBuffer ? processedBuffer.duration : 0;
+      currentTimeEl.textContent = formatTime(Math.max(0,pos));
+      if(dur>0) seekEl.value = Math.max(0,Math.min(100,(pos/dur)*100));
+    }
+  }
+  draw();
+}
+
+/* Seek handler */
+seekEl.addEventListener('input', async e => {
+  if(!processedBuffer) return;
+  const pct = Number(e.target.value)/100;
+  const t = pct * processedBuffer.duration;
+  // If playing, restart at new position
+  const wasPlaying = !!sourceNode;
+  if(wasPlaying) {
+    stopPlayback(false);
+  }
+  pausedAt = t;
+  if(wasPlaying) startPlayback();
+});
+
+/* Play/pause/stop buttons */
+playBtn.addEventListener('click', async ()=>{
+  if(!currentTrack) {
+    // pick first track if exists
+    const all = await getAllTracks();
+    if(all.length===0) return alert('No tracks in library. Add files first.');
+    await selectTrack(all[0].id);
+  }
+  if(!processedBuffer) await prepareTrackForPlayback(currentTrack);
+  startPlayback();
+});
+pauseBtn.addEventListener('click', ()=> pausePlayback());
+stopBtn.addEventListener('click', ()=> stopPlayback());
+
+gainEl.addEventListener('input', async ()=>{
+  // reprocess current track with new gain
+  if(!currentTrack) return;
+  const wasPlaying = !!sourceNode;
+  if(wasPlaying) stopPlayback(false);
+  processedBuffer = null;
+  await prepareTrackForPlayback(currentTrack);
+  if(wasPlaying) startPlayback();
+});
+
+/* -----------------------------
+   Utilities
+   ----------------------------- */
+function formatTime(t){
+  if(!isFinite(t)) return '00:00';
+  const s = Math.floor(t%60); const m = Math.floor(t/60);
+  return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+function timeAgo(ts){
+  const sec = Math.floor((Date.now()-ts)/1000);
+  if(sec<60) return `${sec}s ago`;
+  if(sec<3600) return `${Math.floor(sec/60)}m ago`;
+  if(sec<86400) return `${Math.floor(sec/3600)}h ago`;
+  return `${Math.floor(sec/86400)}d ago`;
+}
+function escapeHtml(s){ return s.replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]); }
+
+/* -----------------------------
+   Service Worker registration (single-file approach)
+   Create a blob URL for the worker script so everything stays in one file.
+   ----------------------------- */
+async function registerInlineServiceWorker(){
+  if(!('serviceWorker' in navigator)) return;
+  const swCode = `self.addEventListener('install', event => {
+    self.skipWaiting();
+    event.waitUntil(
+      caches.open('ytms-shell-v1').then(cache => {
+        // Cache the navigation page for offline (the HTML itself)
+        return cache.addAll(['./']);
+      })
+    );
+  });
+  self.addEventListener('activate', e => { self.clients.claim(); });
+  self.addEventListener('fetch', e => {
+    // Network-first for navigation, cache-first for others
+    if(e.request.mode === 'navigate'){
+      e.respondWith(fetch(e.request).catch(()=> caches.match('./')));
+      return;
+    }
+    e.respondWith(
+      caches.match(e.request).then(r => r || fetch(e.request).catch(()=> caches.match('./')))
+    );
+  });`;
+  try{
+    const blob = new Blob([swCode], {type:'application/javascript'});
+    const swUrl = URL.createObjectURL(blob);
+    await navigator.serviceWorker.register(swUrl, {scope: './'});
+    console.log('Service worker registered (inline blob).');
+  }catch(err){
+    console.warn('Service worker registration failed:', err);
+  }
+}
+registerInlineServiceWorker();
+
+/* -----------------------------
+   Startup & UI events
+   ----------------------------- */
+renderLibrary();
+document.addEventListener('visibilitychange', ()=> {
+  if(document.hidden) cancelAnimationFrame(rafId);
+});
+clearCacheBtn.addEventListener('click', async ()=>{
+  if(!confirm('Clear cached app shell and local library? (App shell cache + IndexedDB)')) return;
+  // delete caches
+  if('caches' in window){
+    const keys = await caches.keys();
+    for(const k of keys) await caches.delete(k);
+  }
+  await clearDB();
+  renderLibrary();
+  alert('Cleared.');
+});
+
+/* On load: set initial state */
+(async ()=> {
+  detectGPU();
+  backendEl.textContent = 'detecting...';
+  setTimeout(()=> { backendEl.textContent = backend; }, 200);
+})();
+</script>
+</body>
+</html>
